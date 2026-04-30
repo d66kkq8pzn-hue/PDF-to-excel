@@ -4,7 +4,7 @@ import pdf2image
 import pytesseract
 import re
 
-st.title("事務機使用量批次統計工具 (空間座標定位版) 🚀")
+st.title("事務機使用量批次統計工具 (空間座標寬容版) 🚀")
 st.write("支援 CSV、Excel 與 **掃描版 PDF**。系統將精準對齊表頭座標抓取資料。")
 
 uploaded_files = st.file_uploader("選擇檔案", type=['csv', 'xlsx', 'pdf'], accept_multiple_files=True)
@@ -29,39 +29,41 @@ if uploaded_files:
             elif file.name.lower().endswith('.pdf'):
                 st.info(f"正在使用 AI 空間定位辨識掃描檔：{file.name} (請稍候...)")
                 
-                images = pdf2image.convert_from_bytes(file.read())
+                images = pdf2image.convert_from_bytes(file.read(), dpi=200) # 固定 DPI 避免像素過大
                 pdf_extracted_rows = []
                 
                 for img in images:
-                    # 使用 image_to_data 獲取每個單字的實體座標 (x, y, w, h)
                     ocr_data = pytesseract.image_to_data(img, lang='eng+chi_tra', output_type=pytesseract.Output.DICT)
                     
-                    # 1. 尋找「使用者ID」表頭的 X 軸座標範圍
                     id_col_left = -1
                     id_col_right = -1
                     
-                    # 順便判斷報表類型
                     text_full = " ".join([str(t) for t in ocr_data['text'] if str(t).strip()])
                     is_copy = True if "複印" in text_full else False
                     is_print = True if "列印" in text_full else False
                     is_color_machine = True if "彩色" in text_full else False
                     
+                    # 1. 尋找「使用者ID」表頭 (增加寬容度，去除所有空格再比對)
                     for i in range(len(ocr_data['text'])):
-                        word = str(ocr_data['text'][i]).strip()
-                        if "使用者ID" in word or word == "ID":
+                        word = str(ocr_data['text'][i])
+                        clean_word = word.replace(" ", "").upper()
+                        
+                        # 只要包含 ID 兩個英文字母，通常就是我們要的表頭
+                        if "使用者ID" in clean_word or "ID" in clean_word:
                             id_col_left = ocr_data['left'][i]
-                            # 增加一點寬容度 (向左右擴展)，因為下方文字可能稍微凸出
-                            id_col_right = id_col_left + ocr_data['width'][i] + 30 
-                            id_col_left -= 30
+                            # 增加左右捕獲範圍至 50 像素，因為資料欄位有時會比表頭寬或稍微偏移
+                            id_col_right = id_col_left + ocr_data['width'][i] + 50 
+                            id_col_left -= 50
                             break
                     
-                    # 如果找不到表頭，代表這頁可能沒有資料，跳過
                     if id_col_left == -1:
                         continue
 
-                    # 2. 將散落的單字依據 Y 軸重新組合成「行」 (Line)
-                    # Y 座標相近的單字視為同一行 (容差 15 像素)
+                    # 2. 將單字組合成行 (自動適應 Y 軸容差)
+                    # 設定容差為圖片高度的 1.5%，這比寫死 15 像素更安全
+                    y_tolerance = img.height * 0.015 
                     lines = {}
+                    
                     for i in range(len(ocr_data['text'])):
                         word = str(ocr_data['text'][i]).strip()
                         if not word: continue
@@ -70,10 +72,9 @@ if uploaded_files:
                         x = ocr_data['left'][i]
                         w = ocr_data['width'][i]
                         
-                        # 尋找是否已有相近的 Y 座標行
                         found_line = False
                         for line_y in lines.keys():
-                            if abs(y - line_y) < 15:
+                            if abs(y - line_y) < y_tolerance:
                                 lines[line_y].append({'text': word, 'x': x, 'w': w})
                                 found_line = True
                                 break
@@ -82,45 +83,38 @@ if uploaded_files:
                             lines[y] = [{'text': word, 'x': x, 'w': w}]
                             
                     # 3. 逐行解析資料
-                    # 將行依據 Y 座標由上到下排序
                     sorted_lines = sorted(lines.items(), key=lambda item: item[0])
                     
                     for y, words in sorted_lines:
-                        # 將同行單字依據 X 座標由左到右排序
                         words = sorted(words, key=lambda w: w['x'])
-                        
-                        # 提取整行文字，方便後續判斷黑名單
                         line_text = " ".join([w['text'] for w in words])
                         
                         # 黑名單檢查
                         ignore_words_lower = ['no.', 'ko', 'ce', 'apeos', '報表', '總計', '頁數', '張數', '最終', 'job', 'owner']
-                        if any(bad_word in line_text.lower() for bad_word in ignore_words_lower):
+                        # 為了避免誤殺，我們只檢查這行是否有「單獨出現」的黑名單字眼
+                        clean_line_lower = re.sub(r'[^a-z0-9\s]', '', line_text.lower()).split()
+                        if any(bad_word in clean_line_lower for bad_word in ignore_words_lower):
                             continue
                             
-                        # 提取這行的所有數字
                         numbers = [int(w['text']) for w in words if w['text'].isdigit()]
                         if not numbers:
                             continue
 
-                        # 【核心定位邏輯】：尋找 X 座標落在「使用者ID」直行下方的文字
+                        # 核心定位邏輯
                         real_user_id = None
                         
                         for w in words:
                             word_center_x = w['x'] + (w['w'] / 2)
-                            # 如果這個單字的中心點，落在「使用者ID」的左右邊界內
                             if id_col_left <= word_center_x <= id_col_right:
-                                # 清除雜質
                                 clean_t = re.sub(r'[^a-zA-Z0-9]', '', w['text'])
-                                if clean_t and clean_t not in ['0', '9999999', '99999999999999']: # 避開卡號等無效數字
+                                if clean_t and clean_t not in ['0', '9999999', '99999999999999']:
                                     real_user_id = clean_t
                                     break
                                     
                         if not real_user_id:
                             continue
 
-                        # ==========================================
-                        # 數字抓取邏輯 (取得最後面的印量數字)
-                        # ==========================================
+                        # 數字抓取邏輯
                         copy_bw, copy_color, print_bw, print_color = 0, 0, 0, 0
                         
                         try:
@@ -198,4 +192,4 @@ if uploaded_files:
         st.dataframe(summary_df)
         
         csv = summary_df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下載統計結果 (CSV)", data=csv, file_name="事務機彙整統計表_精準對齊版.csv", mime="text/csv")
+        st.download_button("📥 下載統計結果 (CSV)", data=csv, file_name="事務機彙整統計表_寬容版.csv", mime="text/csv")
