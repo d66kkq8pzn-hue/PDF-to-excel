@@ -4,8 +4,8 @@ import pdf2image
 import pytesseract
 import re
 
-st.title("事務機使用量批次統計工具 (空間座標寬容版) 🚀")
-st.write("支援 CSV、Excel 與 **掃描版 PDF**。系統將精準對齊表頭座標抓取資料。")
+st.title("事務機使用量批次統計工具 (錨點定位終極版) 🚀")
+st.write("支援 CSV、Excel 與 **掃描版 PDF**。AI 將精準反推抓取任何格式的 UserID。")
 
 uploaded_files = st.file_uploader("選擇檔案", type=['csv', 'xlsx', 'pdf'], accept_multiple_files=True)
 
@@ -27,94 +27,76 @@ if uploaded_files:
                 df = pd.read_excel(file)
                 
             elif file.name.lower().endswith('.pdf'):
-                st.info(f"正在使用 AI 空間定位辨識掃描檔：{file.name} (請稍候...)")
+                st.info(f"正在使用 AI 辨識掃描檔：{file.name} (請稍候...)")
                 
-                images = pdf2image.convert_from_bytes(file.read(), dpi=200) # 固定 DPI 避免像素過大
+                images = pdf2image.convert_from_bytes(file.read(), dpi=200)
                 pdf_extracted_rows = []
                 
                 for img in images:
-                    ocr_data = pytesseract.image_to_data(img, lang='eng+chi_tra', output_type=pytesseract.Output.DICT)
+                    text = pytesseract.image_to_string(img, lang='eng+chi_tra')
+                    lines = text.split('\n')
                     
-                    id_col_left = -1
-                    id_col_right = -1
+                    is_copy = True if "複印" in text else False
+                    is_print = True if "列印" in text else False
+                    is_color_machine = True if "彩色" in text else False
                     
-                    text_full = " ".join([str(t) for t in ocr_data['text'] if str(t).strip()])
-                    is_copy = True if "複印" in text_full else False
-                    is_print = True if "列印" in text_full else False
-                    is_color_machine = True if "彩色" in text_full else False
-                    
-                    # 1. 尋找「使用者ID」表頭 (增加寬容度，去除所有空格再比對)
-                    for i in range(len(ocr_data['text'])):
-                        word = str(ocr_data['text'][i])
-                        clean_word = word.replace(" ", "").upper()
+                    for line in lines:
+                        # 將直線符號替換為空白，再切分字串
+                        clean_line = line.replace('|', ' ')
+                        tokens = [t.strip() for t in clean_line.split() if t.strip()]
+                        if not tokens: continue
                         
-                        # 只要包含 ID 兩個英文字母，通常就是我們要的表頭
-                        if "使用者ID" in clean_word or "ID" in clean_word:
-                            id_col_left = ocr_data['left'][i]
-                            # 增加左右捕獲範圍至 50 像素，因為資料欄位有時會比表頭寬或稍微偏移
-                            id_col_right = id_col_left + ocr_data['width'][i] + 50 
-                            id_col_left -= 50
-                            break
-                    
-                    if id_col_left == -1:
-                        continue
-
-                    # 2. 將單字組合成行 (自動適應 Y 軸容差)
-                    # 設定容差為圖片高度的 1.5%，這比寫死 15 像素更安全
-                    y_tolerance = img.height * 0.015 
-                    lines = {}
-                    
-                    for i in range(len(ocr_data['text'])):
-                        word = str(ocr_data['text'][i]).strip()
-                        if not word: continue
+                        numbers = [int(t) for t in tokens if t.isdigit()]
+                        if not numbers: continue
                         
-                        y = ocr_data['top'][i]
-                        x = ocr_data['left'][i]
-                        w = ocr_data['width'][i]
-                        
-                        found_line = False
-                        for line_y in lines.keys():
-                            if abs(y - line_y) < y_tolerance:
-                                lines[line_y].append({'text': word, 'x': x, 'w': w})
-                                found_line = True
-                                break
-                                
-                        if not found_line:
-                            lines[y] = [{'text': word, 'x': x, 'w': w}]
-                            
-                    # 3. 逐行解析資料
-                    sorted_lines = sorted(lines.items(), key=lambda item: item[0])
-                    
-                    for y, words in sorted_lines:
-                        words = sorted(words, key=lambda w: w['x'])
-                        line_text = " ".join([w['text'] for w in words])
-                        
-                        # 黑名單檢查
-                        ignore_words_lower = ['no.', 'ko', 'ce', 'apeos', '報表', '總計', '頁數', '張數', '最終', 'job', 'owner']
-                        # 為了避免誤殺，我們只檢查這行是否有「單獨出現」的黑名單字眼
-                        clean_line_lower = re.sub(r'[^a-z0-9\s]', '', line_text.lower()).split()
-                        if any(bad_word in clean_line_lower for bad_word in ignore_words_lower):
+                        # 黑名單防線：整行若包含總計等字眼直接跳過
+                        if any(bad in line.lower() for bad in ['no job owner', '總計', '報表列印日期']):
                             continue
                             
-                        numbers = [int(w['text']) for w in words if w['text'].isdigit()]
-                        if not numbers:
-                            continue
-
-                        # 核心定位邏輯
+                        # ==========================================
+                        # 【錨點定位法】：尋找 UserID
+                        # ==========================================
                         real_user_id = None
                         
-                        for w in words:
-                            word_center_x = w['x'] + (w['w'] / 2)
-                            if id_col_left <= word_center_x <= id_col_right:
-                                clean_t = re.sub(r'[^a-zA-Z0-9]', '', w['text'])
-                                if clean_t and clean_t not in ['0', '9999999', '99999999999999']:
-                                    real_user_id = clean_t
-                                    break
-                                    
+                        # 定義系統限制碼的特徵 (作為錨點)
+                        limit_codes = ['0', '9999999', '99999999999999', '(禁止)', '禁止']
+                        
+                        # 從左到右掃描，尋找「第一個出現的限制碼」
+                        anchor_index = -1
+                        for i, token in enumerate(tokens):
+                            clean_t = re.sub(r'[^a-zA-Z0-9]', '', token)
+                            if clean_t in limit_codes or token in limit_codes:
+                                anchor_index = i
+                                break
+                                
+                        # 如果找到了限制碼，而且它前面還有字串
+                        if anchor_index > 0:
+                            # UserID 應該是限制碼的「前一個字串」
+                            candidate_index = anchor_index - 1
+                            candidate_token = re.sub(r'[^a-zA-Z0-9]', '', tokens[candidate_index])
+                            
+                            # 檢查這個候選人是不是剛好是 4 碼的「序號」(例如 0001)
+                            # 如果是序號，代表 OCR 排版錯位，真正的 UserID 還要再往前一個
+                            if len(candidate_token) == 4 and candidate_token.isdigit() and candidate_token.startswith('0'):
+                                if candidate_index > 0:
+                                    candidate_index -= 1
+                                    candidate_token = re.sub(r'[^a-zA-Z0-9]', '', tokens[candidate_index])
+                                else:
+                                    candidate_token = ""
+                            
+                            # 如果清出來的候選人有內容，且不是黑名單字眼，這就是 UserID！
+                            ignore_words = ['no', 'ko', 'ce', 'apeos']
+                            if candidate_token and candidate_token.lower() not in ignore_words:
+                                # 再次確保它不是限制碼
+                                if candidate_token not in limit_codes:
+                                    real_user_id = candidate_token
+
                         if not real_user_id:
                             continue
 
+                        # ==========================================
                         # 數字抓取邏輯
+                        # ==========================================
                         copy_bw, copy_color, print_bw, print_color = 0, 0, 0, 0
                         
                         try:
@@ -192,4 +174,4 @@ if uploaded_files:
         st.dataframe(summary_df)
         
         csv = summary_df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下載統計結果 (CSV)", data=csv, file_name="事務機彙整統計表_寬容版.csv", mime="text/csv")
+        st.download_button("📥 下載統計結果 (CSV)", data=csv, file_name="事務機彙整統計表_完成版.csv", mime="text/csv")
